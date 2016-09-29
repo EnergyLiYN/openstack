@@ -1,0 +1,282 @@
+OpenStack主机负载均衡——实例自动迁移
+Ubuntu14.04 LTS
+Openstack juno
+1.OpenStack平台搭建
+Openstack环境搭建参考文档：
+Juno版：http://www.aboutyun.com/thread-11722-1-1.html
+Kilo版：http://www.aboutyun.com/thread-13063-1-1.html
+自kilo版本起，命令格式使用v3版本，详细可参照官网 
+http://docs.openstack.org/mitaka/install-guide-ubuntu/
+
+注意：安装过程中注意管理网络与tunnel网络区分，网络节点需要3张物理网卡，如果物理机只有两张网卡，可将其中一张网卡作为外网网卡。（网上有将网络节点的控制网段作为外网网段设置）
+初始化网络实例时注意要设置外网及其子网(如：ext-net与ext-subnet，用于与外部网络进行数据传输，分配实例的浮动IP)，为每个用户创建属于自己的网络及子网（如：admin-net及admin-subnet，用于该用户下实例的IP分配等），每个网络需要设置路由器，路由器负责连接外网与内网。(http://www.aboutyun.com/thread-11637-1-1.html)
+
+2.热迁移环境配置
+热迁移根据存储区别可分为三类:基于块存储的热迁移、共享存储的热迁移及volume存储的热迁移。本文档的热迁移实际指的是共享存储下的热迁移，其余模式的热迁移读者可自行尝试设置。
+共享存储迁移设置可参考：http://www.aboutyun.com/thread-7878-1-1.html
+共享迁移的配置过程网上繁多，因为系统或版本的不同配置过程不能完全契合，但只要保证迁移原主机与目的主机能够通过libvrit连通即可，可用如下命令测试：
+virsh -c qemu+tcp://目的主机IP/system  
+（若节点间未连通，则会导致迁移失败，日志文件Failed to connect to remote libvirt URI qemu+tcp://ly-compute2/system:）
+
+3.Ceilometer监控工具配置搭建
+1)在控制节点、计算节点上安装和配置ceilometer：
+ubuntu14.04 openstack juno ceilometer服务安装文档链接：
+http://www.bkjia.com/yjs/1039753.html
+官网 opensstack kilo版安装和配置ceilometer链接：
+http://docs.openstack.org/developer/ceilometer/install/manual.html#installing-the-api-server
+
+安装后CLI基本命令总结：
+ceilometer meter-list 				    -查看meters
+ceilometer sample-list -m <meter_name>	-查看某个 meter 收集的具体值
+可通过创建alarm实现报警，本文中是通过设定的阈值进行报警迁移的，因此并没有用到ceilometer自带alarm的报警功能，列在此处为方便使用其功能。
+ceilometer alarm-list				    -查看alarms
+ceilometer alarm-show -a <alarm_ID>		-查看具体某个alarm信息
+
+ceilometer alarm-threshold-create --name host_test5 \
+  --description 'hardware' \
+  --meter-name hardware.system_stats.cpu.idle --threshold 50.0 \
+  --comparison-operator lt --statistic avg \
+  --period 600 --evaluation-periods 1 \
+  --alarm-action 'log://' \
+  --query resource_id=192.168.0.122
+
+•name: 告警名称
+•meter-name：meter 名称
+•threshold: 阈值
+•comparison_operator: 这个参数确定了怎么和阈值进行比较，有6个可选：lt, le, eq, ne, ge, gt，默认是eq
+•statistic: 这个参数确定了使用什么数据去和 threshold 比较，有5种可选：max, min, avg, sum, count，默认是avg
+•period: 这个参数其实有两个作用，一个是确定了获取该监控指标的监控数据的时间范围，和下面的 evaluation_periods 配合使用，另外一个作用就是它确定了两个点之间的时间间隔，默认是60s
+•evaluation_periods: 表示连续的监控间隔数目。和 period 参数相乘，可以确定获取监控数据的时间范围，默认是1。
+•alarm-action：告警产生后的反应。
+•query: 该参数一般用于过滤到监控指标下的某个资源，默认是[]
+
+2)增加硬件监控项
+安装ceilometer后只包含部分实例相关的meters，这里参考官网
+http://docs.openstack.org/admin-guide/telemetry-measurements.html#snmp-based-meters
+其中包含可添加的meter项。
+本文介绍其中snmp based meters添加过程：
+①　安装snmp，snmpd包
+②　修改配置文件/etc/snmp/snmpd.conf：
+#开启监听端口和对应的ip
+agentAddress udp:161,udp6:[::1]:161
+#开启所有SNMP访问项,注释掉前两项，这样的话，我们就可以获取更多的节点信息，否则，我们只能获取两个已注释节点所包含的信息。
+#view   systemonly  included   .1.3.6.1.2.1.1 
+#view   systemonly  included   .1.3.6.1.2.1.25.1
+view systemonly included .1 80
+③　重启snmpd服务
+service snmpd restart
+④　测试
+snmpwalk -v 2c -c public localhost .1.3.6.1.4.1.2021.4.3.0
+⑤　修改ceilometer的/etc/ceilometer/pipeline.yaml配置：
+#添加监控项
+sources:  # 在sources段下增加如下配置：
+    - name: hardware_source
+      interval: 600 #监控间隔时间 单位s
+      meters:
+          - "hardware.*"
+      resources:
+          - snmp://*.*.*.*  # 被监控的物理机snmpd服务ip，可以同时加入多行，表示同时监控多个物理机
+          - snmp://*.*.*.*
+      sinks:
+          - meter_sink
+⑥　测试新添加meter项
+ceilometer sample-list -m hardware.memory.total
+
+4.自动热迁移实现代码
+import os
+import time
+import novaclient.client as novaClient
+import ceilometerclient.client as ceilClient
+
+os.environ["OS_AUTH_URL"] = "http://controller:5000/v2.0"
+os.environ["OS_TENANT_ID"] = "79d68664d0244f9a34c202498f1e839"
+os.environ["OS_TENANT_NAME"] = "admin"
+os.environ["OS_USERNAME"] = "admin"
+os.environ["OS_PASSWORD"] = "123456"
+
+#ip-host_name对应关系
+HOST_DIRS = {'192.168.0.116': 'compute1',
+             '192.168.0.122': 'compute2'}
+#阈值
+THRESHOLD = 20
+#监控项
+METER_CPU = 'hardware.system_stats.cpu.idle'
+METER_MEMORY_TOTAL = 'hardware.memory.total'
+METER_MEMORY_USED = 'hardware.memory.used'
+
+#获取nova授权凭证
+def get_nova_credentials_v2():
+    d = {}
+    d['version'] = '2'
+    d['username'] = os.environ['OS_USERNAME']
+    d['api_key'] = os.environ['OS_PASSWORD']
+    d['auth_url'] = os.environ['OS_AUTH_URL']
+    d['project_id'] = os.environ['OS_TENANT_NAME']
+    return d
+
+#获取ceilometer授权凭证
+def get_ceil_credentials_v2():
+    d = {}
+    d['os_username'] = os.environ['OS_USERNAME']
+    d['os_password'] = os.environ['OS_PASSWORD']
+    d['os_auth_url'] = os.environ['OS_AUTH_URL']
+    d['os_tenant_name'] = os.environ['OS_TENANT_NAME']
+    return d
+'''
+	#获取迁移的目的主机名
+	#sample_list：多个compute节点hardware.system_stats.cpu.idle的值列表
+	#instance_memory：迁移实例的内存
+'''
+def get_migrate_dest(sample_list, instance_memory):
+	# 物理机ip列表
+    resource_id_list = []
+    # 物理机空闲率列表
+    idle_list = []
+    host_migrate = ''
+    resource_id = ''
+    for sam in sample_list:
+        if sam.counter_volume < THRESHOLD:
+            continue
+        resource_id_list.append(sam.resource_id)
+        idle_list.append(sam.counter_volume)
+    if not idle_list:
+        return None
+    print(resource_id_list)
+    print(idle_list)
+    while True:
+        if not idle_list:
+            return None
+        index = idle_list.index(max(idle_list))
+        resource_id = resource_id_list[index]
+        query = [{'field': 'resource_id', 'op': 'eq', 'value': resource_id}]
+        memory_total = ceilometer_client.samples.list(
+            meter_name=METER_MEMORY_TOTAL, q=query, limit=1)[0].counter_volume
+        memory_used = ceilometer_client.samples.list(
+            meter_name=METER_MEMORY_USED, q=query, limit=1)[0].counter_volume
+        print("memory_total:" + memory_total + " memory_used:" + memory_used)
+        memory_unused = (memory_total - memory_used) / 1024
+        print(memory_unused)
+        if memory_unused > instance_memory:
+            break
+        else:
+            idle_list.pop(index)
+            resource_id_list.pop(index)
+    host_migrate = HOST_DIRS[resource_id]
+    print('dest:' + host_migrate)
+    return host_migrate
+
+#获取compute节点个数
+def get_computeNode_num():
+    numOfHost = 0
+    host_list = nova_client.hosts.list()
+    for h in host_list:
+        if h.service == 'compute':
+            numOfHost = numOfHost + 1
+    print(numOfHost)
+    return numOfHost
+
+#标准化
+def MaxMinNormalization(cpu_util_list, Min, Max):
+    k = []
+    for x in cpu_util_list:
+        x = (x - Min) / (Max - Min)
+        k.append(x)
+    return k
+#获取全部实例数量
+def allcountofinstance():
+    allserver_list = nova_client.servers.list(search_opts={'all_tenants': '1'})
+    serverallcount = 0
+    for k in allserver_list:
+        serverallcount = serverallcount + 1
+    return serverallcount
+#获取选定实例的内存
+def search_memory(rid):
+    query = [{'field': 'resource_id', 'op': 'eq', 'value': rid}]
+    sample_memory_list = ceilometer_client.samples.list(
+        meter_name='memory', q=query, limit=1)
+    return sample_memory_list[0].counter_volume
+#选中某主机的要迁移的实例
+def choose_instance(compute):
+    server_all_count = allcountofinstance()
+    sample_list = ceilometer_client.samples.list(
+        meter_name='cpu_util', limit='%s' % server_all_count)
+    server_list = nova_client.servers.list(
+        search_opts={'host': compute, 'all_tenants': '1'})
+    cpu_util_list = []
+    resource_id_list = []
+    # print sample_list[0]
+    for f in sample_list:
+        for s in server_list:
+            if f.resource_id == s.id:
+                print(f.resource_id + " " + str(f.counter_volume))
+                cpu_util_list.append(str(f.counter_volume))
+                resource_id_list.append(f.resource_id)
+    print(cpu_util_list)
+    cpu_util_list = map(float, cpu_util_list)
+    minimum = min(cpu_util_list)
+    maxmum = max(cpu_util_list)
+    if minimum > 0 or maxmum > 0:
+        if len(cpu_util_list) > 1:
+            after_normalize_list = MaxMinNormalization(
+                cpu_util_list, minimum, maxmum)
+            indextomax = [i for i, x in enumerate(
+                after_normalize_list) if x == max(after_normalize_list)]
+            itm = int(indextomax[0])
+            return resource_id_list[itm]
+        elif len(cpu_util_list) == 1:
+            itm = 0
+            return resource_id_list[itm]
+        else:
+            return None
+    else:
+        return None
+#监控物理机，实现负载均衡
+def ceilometer_migrate():
+
+    numOfHost = get_computeNode_num() - 1
+
+    sample_list_load = ceilometer_client.samples.list(
+        meter_name=METER_CPU, limit=numOfHost)
+
+    isOverLoad = False
+    #超负载主机名
+    host_overhost = ''
+    #迁移目的主机名
+    host_migrate = ''
+    for sam in sample_list_load:
+        if sam.counter_volume < THRESHOLD:
+            host_overhost = sam.resource_id
+            isOverLoad = True
+            host_overhost = HOST_DIRS[host_overhost]
+            print('source:' + host_overhost)
+            break
+    if isOverLoad:
+        instanceID = choose_instance(host_overhost)
+        instance_memory = search_memory(instanceID)
+        if instanceID:
+            host_migrate = get_migrate_dest(sample_list_load, instance_memory)
+            if host_migrate:
+                try:
+                    server = nova_client.servers.get(server=instanceID)
+                    server.live_migrate(host=host_migrate)
+                except Exception as e:
+                    print(e)
+                print("migrate")
+            else:
+                print("all compute node over load")
+        else:
+            print("no instance")
+    else:
+        print("System not over load")
+
+#获取nova客户端
+nova_creds = get_nova_credentials_v2()
+nova_client = novaClient.Client(**nova_creds)
+#获取ceilometer客户端
+ceil_creds = get_ceil_credentials_v2()
+ceilometer_client = ceilClient.get_client('2', **ceil_creds)
+
+#10分钟循环监控
+while True:
+    ceilometer_migrate()
+    time.sleep(600)
