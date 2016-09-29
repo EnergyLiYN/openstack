@@ -1,7 +1,9 @@
 OpenStack主机负载均衡——实例自动迁移
+===============================
 Ubuntu14.04 LTS
 Openstack juno
 1.OpenStack平台搭建
+-----------
 Openstack环境搭建参考文档：
 Juno版：http://www.aboutyun.com/thread-11722-1-1.html
 Kilo版：http://www.aboutyun.com/thread-13063-1-1.html
@@ -12,6 +14,7 @@ http://docs.openstack.org/mitaka/install-guide-ubuntu/
 初始化网络实例时注意要设置外网及其子网(如：ext-net与ext-subnet，用于与外部网络进行数据传输，分配实例的浮动IP)，为每个用户创建属于自己的网络及子网（如：admin-net及admin-subnet，用于该用户下实例的IP分配等），每个网络需要设置路由器，路由器负责连接外网与内网。(http://www.aboutyun.com/thread-11637-1-1.html)
 
 2.热迁移环境配置
+---------------
 热迁移根据存储区别可分为三类:基于块存储的热迁移、共享存储的热迁移及volume存储的热迁移。本文档的热迁移实际指的是共享存储下的热迁移，其余模式的热迁移读者可自行尝试设置。
 共享存储迁移设置可参考：http://www.aboutyun.com/thread-7878-1-1.html
 共享迁移的配置过程网上繁多，因为系统或版本的不同配置过程不能完全契合，但只要保证迁移原主机与目的主机能够通过libvrit连通即可，可用如下命令测试：
@@ -19,6 +22,7 @@ virsh -c qemu+tcp://目的主机IP/system
 （若节点间未连通，则会导致迁移失败，日志文件Failed to connect to remote libvirt URI qemu+tcp://ly-compute2/system:）
 
 3.Ceilometer监控工具配置搭建
+--------------------------------
 1)在控制节点、计算节点上安装和配置ceilometer：
 ubuntu14.04 openstack juno ceilometer服务安装文档链接：
 http://www.bkjia.com/yjs/1039753.html
@@ -83,6 +87,7 @@ sources:  # 在sources段下增加如下配置：
 ceilometer sample-list -m hardware.memory.total
 
 4.自动热迁移实现代码
+-------------------------
 import os
 import time
 import novaclient.client as novaClient
