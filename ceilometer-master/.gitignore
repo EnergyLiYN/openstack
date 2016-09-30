@@ -1,0 +1,18 @@
+*.egg*
+*.mo
+*.pyc
+.coverage
+.testrepository
+.tox
+AUTHORS
+build/*
+ChangeLog
+cover/*
+dist/*
+doc/build
+doc/source/api/
+etc/ceilometer/ceilometer.conf
+subunit.log
+
+# Files created by releasenotes build
+releasenotes/build
